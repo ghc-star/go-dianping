@@ -91,3 +91,50 @@ func (r *Repository) ShopChange(ctx context.Context, in dto.ShopInput) error {
 	}
 	return nil
 }
+
+func (r *Repository) ShopListByType(
+	ctx context.Context,
+	typeId int64,
+	page int,
+	size int,
+) ([]model.Shop, error) {
+	shops := make([]model.Shop, 0)
+	err := r.DB.
+		WithContext(ctx).
+		Where("type_id=?", typeId).
+		Order("id ASC").
+		Limit(size).
+		Offset((page - 1) * size).
+		Find(&shops).
+		Error
+	return shops, err
+}
+
+func (r *Repository) ShopListByIDs(
+	ctx context.Context,
+	ids []int64,
+) ([]model.Shop, error) {
+	shops := make([]model.Shop, 0)
+
+	if len(ids) == 0 {
+		return shops, nil
+	}
+
+	err := r.DB.
+		WithContext(ctx).
+		Where("id IN ?", ids).
+		Find(&shops).
+		Error
+
+	return shops, err
+}
+
+func (r *Repository) ShopAll(ctx context.Context) ([]model.Shop, error) {
+	shops := make([]model.Shop, 0)
+	err := r.DB.
+		WithContext(ctx).
+		Order("id ASC").
+		Find(&shops).
+		Error
+	return shops, err
+}

@@ -21,3 +21,12 @@ type UpdateUserInfoRequest struct {
 	Introduce *string `json:"introduce"`
 	Birthday  *string `json:"birthday"`
 }
+
+type FollowRequest struct {
+	FollowUserID int64 `json:"followUserId" binding:"required,gt=0"`
+	IsFollow     *bool `json:"isFollow" binding:"required"`
+}
+
+type FollowTargetRequest struct {
+	FollowUserID int64 `json:"followUserId" binding:"required,gt=0"`
+}

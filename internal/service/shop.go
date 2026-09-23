@@ -17,14 +17,18 @@ import (
 	"github.com/learning/go-dianping/internal/model"
 	"github.com/learning/go-dianping/internal/repository"
 	"github.com/redis/go-redis/v9"
+	"golang.org/x/sync/singleflight"
 )
 
 var ErrInvalidShopCreat = errors.New("商铺参数错误")
+var ErrInvalidShopQuery = errors.New("商铺查询参数错误")
+var ErrGeoUnavailable = errors.New("GEO服务不可用")
 
 type ShopService struct {
-	repo  *repository.Repository
-	rdb   *redis.Client
-	cache *cache.Client
+	repo      *repository.Repository
+	rdb       *redis.Client
+	cache     *cache.Client
+	geoFlight singleflight.Group
 }
 
 func NewShopRepository(
@@ -75,6 +79,17 @@ func validateShop(shop *model.Shop) error {
 	}
 
 	return nil
+}
+
+func validCoordinates(x, y float64) bool {
+	return !math.IsNaN(x) &&
+		!math.IsNaN(y) &&
+		!math.IsInf(x, 0) &&
+		!math.IsInf(y, 0) &&
+		x >= -180 &&
+		x <= 180 &&
+		y >= -85.05112878 &&
+		y <= 85.05112878
 }
 
 func (s *ShopService) GetByID(
@@ -195,6 +210,56 @@ func (s *ShopService) SyncGeo(
 	return err
 }
 
+func (s *ShopService) WarmGeo(ctx context.Context) error {
+	shops, err := s.repo.ShopAll(ctx)
+	if err != nil {
+		return err
+	}
+	groups := make(map[int64][]*redis.GeoLocation)
+	for _, shop := range shops {
+		if !validCoordinates(shop.X, shop.Y) {
+			return fmt.Errorf(
+				"商铺%d的经纬度无效",
+				shop.Id,
+			)
+		}
+		location := &redis.GeoLocation{
+			Name:      strconv.FormatInt(shop.Id, 10),
+			Longitude: shop.X,
+			Latitude:  shop.Y,
+		}
+		groups[shop.TypeID] = append(groups[shop.TypeID], location)
+	}
+	// 使用 Pipeline 批量写入 Redis
+	pipe := s.rdb.TxPipeline()
+
+	for typeID, locations := range groups {
+		key := "practice:shop:geo:" +
+			strconv.FormatInt(typeID, 10)
+
+		pipe.GeoAdd(ctx, key, locations...)
+	}
+
+	// 标记 GEO 已完成预热
+	pipe.Set(
+		ctx,
+		shopGeoReadyKey,
+		"1",
+		10*time.Minute,
+	)
+
+	_, err = pipe.Exec(ctx)
+	if err != nil {
+		return fmt.Errorf(
+			"%w: GEO索引写入失败: %v",
+			ErrGeoUnavailable,
+			err,
+		)
+	}
+
+	return nil
+}
+
 const shopGeoReadyKey = "practice:shop:geo:ready"
 
 func (s *ShopService) geoFailed(ctx context.Context, cause error) {
@@ -246,4 +311,151 @@ func (s *ShopService) ShopUpdate(ctx context.Context, in dto.ShopInput) error {
 		s.geoFailed(ctx, err)
 	}
 	return nil
+}
+
+func (s *ShopService) ListByType(
+	ctx context.Context,
+	typeID int64,
+	current int,
+	x, y *float64,
+) ([]model.Shop, error) {
+	if typeID <= 0 {
+		return nil, fmt.Errorf(
+			"%w: 商铺类型ID必须大于0",
+			ErrInvalidShopQuery,
+		)
+	}
+	if current < 1 {
+		return nil, fmt.Errorf(
+			"%w: 页码必须大于0",
+			ErrInvalidShopQuery,
+		)
+	}
+	if x == nil && y == nil {
+		return s.repo.ShopListByType(
+			ctx,
+			typeID,
+			current,
+			5,
+		)
+	}
+
+	if x == nil || y == nil {
+		return nil, fmt.Errorf(
+			"%w: x和y必须同时提供",
+			ErrInvalidShopQuery,
+		)
+	}
+	if !validCoordinates(*x, *y) {
+		return nil, fmt.Errorf(
+			"%w: x和y超出经纬度范围",
+			ErrInvalidShopQuery,
+		)
+	}
+	ready, err := s.rdb.Exists(ctx, shopGeoReadyKey).Result()
+	if err != nil {
+		return nil, fmt.Errorf(
+			"%w: 检查GEO索引状态失败: %v",
+			ErrGeoUnavailable,
+			err,
+		)
+	}
+	if ready == 0 {
+		_, err, _ := s.geoFlight.Do(
+			shopGeoReadyKey,
+			func() (any, error) {
+				return nil, s.WarmGeo(ctx)
+			},
+		)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"GEO索引重建失败:%w",
+				err,
+			)
+		}
+	}
+	from := (current - 1) * 5
+	to := current * 5
+	// 按商铺类型建立 GEO key
+	geoKey := "practice:shop:geo:" +
+		strconv.FormatInt(typeID, 10)
+
+	items, err := s.rdb.GeoSearchLocation(
+		ctx,
+		geoKey,
+		&redis.GeoSearchLocationQuery{
+			GeoSearchQuery: redis.GeoSearchQuery{
+				Longitude:  *x,
+				Latitude:   *y,
+				Radius:     5000,
+				RadiusUnit: "m",
+				Sort:       "ASC",
+				Count:      to,
+			},
+			WithDist: true,
+		},
+	).Result()
+	if err != nil {
+		return nil, fmt.Errorf(
+			"%w: GEO查询失败: %v",
+			ErrGeoUnavailable,
+			err,
+		)
+	}
+	if len(items) <= from {
+		return []model.Shop{}, nil
+	}
+
+	// 截取当前页
+	items = items[from:]
+
+	// 先把 Redis 返回的商铺 ID 解析出来
+	ids := make([]int64, 0, len(items))
+
+	for _, item := range items {
+		id, err := strconv.ParseInt(item.Name, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("Redis GEO中的商铺ID无效: %w", err)
+		}
+
+		ids = append(ids, id)
+	}
+	// 根据 Redis GEO 返回的 ID，批量查询 MySQL
+	shops, err := s.repo.ShopListByIDs(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+
+	// MySQL 返回的顺序不一定和 ids 一样。
+	// 先转换成 map，方便根据 ID 快速查找。
+	shopByID := make(map[int64]model.Shop, len(shops))
+
+	for _, shop := range shops {
+		shopByID[shop.Id] = shop
+	}
+
+	// 按 Redis GEO 返回的顺序重新组装结果
+	ordered := make([]model.Shop, 0, len(ids))
+
+	for i, id := range ids {
+		shop, exists := shopByID[id]
+		if !exists {
+			// Redis 中有这个 ID，但数据库已经没有了，跳过它。
+			continue
+		}
+
+		// GEO key 按类型保存，正常情况下这里一定相等。
+		// 这个判断可以避免脏数据混入结果。
+		if shop.TypeID != typeID {
+			continue
+		}
+
+		// items[i] 和 ids[i] 一一对应
+		distance := items[i].Dist
+		shop.Distance = &distance
+
+		ordered = append(ordered, shop)
+	}
+
+	return ordered, nil
 }

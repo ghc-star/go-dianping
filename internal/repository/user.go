@@ -121,3 +121,16 @@ func (r *Repository) SetPassword(
 		Update("password", passwordHash).
 		Error
 }
+
+func (r *Repository) FindUsersByIDs(
+	ctx context.Context,
+	ids []int64,
+) ([]model.User, error) {
+	var users []model.User
+	err := r.DB.
+		WithContext(ctx).
+		Where("id IN ?", ids).
+		Find(&users).
+		Error
+	return users, err
+}

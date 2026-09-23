@@ -121,3 +121,95 @@ func (h *ShopHandler) ShopUpdate(c *gin.Context) {
 		"success": true,
 	})
 }
+
+func (h *ShopHandler) ListByType(c *gin.Context) {
+	typeID, err := strconv.ParseInt(
+		c.Query("typeId"),
+		10,
+		64,
+	)
+	if err != nil || typeID <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success":  false,
+			"errorMsg": "typeId必须是正整数",
+		})
+		return
+	}
+	current := 1
+	currentText := c.Query("current")
+	if currentText != "" {
+		current, err = strconv.Atoi(currentText)
+		if err != nil || current <= 0 {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"success":  false,
+				"errorMsg": "current必须是正整数",
+			})
+			return
+		}
+	}
+	xText := c.Query("x")
+	yText := c.Query("y")
+	var x *float64
+	var y *float64
+	if xText == "" && yText == "" {
+
+	} else {
+		if xText == "" || yText == "" {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"success":  false,
+				"errorMsg": "x和y必须同时提供",
+			})
+			return
+		}
+		xx, err1 := strconv.ParseFloat(xText, 64)
+		yy, err2 := strconv.ParseFloat(yText, 64)
+
+		if err1 != nil || err2 != nil {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"success":  false,
+				"errorMsg": "x和y必须是数字",
+			})
+			return
+		}
+		x = &xx
+		y = &yy
+	}
+	shops, err := h.shop.ListByType(
+		c.Request.Context(),
+		typeID,
+		current,
+		x,
+		y,
+	)
+	if err != nil {
+		log.Printf("查询分类商铺失败：%v", err)
+
+		if errors.Is(err, service.ErrInvalidShopQuery) {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"success":  false,
+				"errorMsg": err.Error(),
+			})
+			return
+		}
+
+		if errors.Is(err, service.ErrGeoUnavailable) {
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"success":  false,
+				"errorMsg": "附近商铺服务暂时不可用",
+			})
+			return
+		}
+
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"success":  false,
+			"errorMsg": "查询商铺失败",
+		})
+		return
+	}
+
+	// 5. 返回结果
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data":    shops,
+	})
+}

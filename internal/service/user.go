@@ -177,6 +177,9 @@ func (s *UserService) GetSession(
 	key := "practice:login:token:" + token
 	data, err := s.rdb.GetEx(ctx, key, sessionTTL).Result()
 	if errors.Is(err, redis.Nil) {
+		return nil, nil
+	}
+	if err != nil {
 		return nil, err
 	}
 	var user dto.UserDTO
