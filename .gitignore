@@ -1,0 +1,8 @@
+# 构建产物
+/bin/
+
+# 本地运行时数据：上传的图片、本地依赖（Memurai）、Go 构建缓存、各种日志
+/data/
+/.local/
+/.gocache/
+*.log
