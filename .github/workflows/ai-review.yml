@@ -91,22 +91,25 @@ jobs:
             '{model: $model, temperature: 0.2,
               messages: [{role: "system", content: $system}, {role: "user", content: $user}]}')
 
-          # ── 3. 调用模型（OpenAI 兼容接口）──
+          # ── 3. 调用模型（OpenAI 兼容接口）；任何异常都把原始响应打进日志便于排查 ──
           AUTH="${AI_REVIEW_API_KEY:-$GITHUB_TOKEN}"
-          RESPONSE=$(curl -sf --max-time 180 \
+          HTTP_CODE=$(curl -sL --max-time 180 -o model_resp.json -w '%{http_code}' \
             "$AI_REVIEW_BASE_URL/chat/completions" \
             -H "Authorization: Bearer $AUTH" \
             -H "Content-Type: application/json" \
-            -d "$PAYLOAD") || {
-              echo "模型调用失败。用 GitHub Models 时请确认公共仓库额度；或配置 AI_REVIEW_API_KEY 换用第三方接口。"
-              exit 1
-            }
-          REVIEW=$(printf '%s' "$RESPONSE" | jq -r '.choices[0].message.content // empty')
-          if [ -z "$REVIEW" ]; then
-            echo "模型没有返回内容，原始响应："
-            printf '%s\n' "$RESPONSE" | head -c 2000
+            -d "$PAYLOAD") || { echo "curl 本身失败（exit=$?）。"; exit 1; }
+          echo "模型接口返回 HTTP $HTTP_CODE。"
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "非 200 响应，原始内容："
+            head -c 2000 model_resp.json
             exit 1
           fi
+          if ! REVIEW=$(jq -r '.choices[0].message.content // empty' model_resp.json 2>/dev/null) || [ -z "$REVIEW" ]; then
+            echo "响应不是合法的补全 JSON 或没有内容，原始内容："
+            head -c 2000 model_resp.json
+            exit 1
+          fi
+          rm -f model_resp.json
 
           # ── 4. 可选拦截：发现指定级别问题就让流水线失败 ──
           if [ -n "$AI_REVIEW_BLOCK_ON_SEVERITIES" ]; then
