@@ -34,13 +34,13 @@ env:
   AI_REVIEW_SKILLS_FILE: .github/ai-review/skills.md # 项目规则
   AI_REVIEW_OUTPUT_MARKER: "<!-- ai-review-bot -->" # 评论尾部的隐藏标记，用于找到并更新既有评论
   AI_REVIEW_MAX_DIFF_CHARS: "60000" # 发给模型的 diff 上限（控制成本）
-  # 模型走任意 OpenAI 兼容接口，凭据放仓库 Secret AI_REVIEW_API_KEY。
+  # 模型走任意 OpenAI 兼容接口（官方 API、中转站均可），凭据放仓库 Secret AI_REVIEW_API_KEY。
   # 注意：GitHub Models 已于 2026-07-30 退役，不能再依赖内置 GITHUB_TOKEN 调模型。
-  # 下面按 DeepSeek 配置（key 申请：platform.deepseek.com）；
-  # 换其他服务商只需改这两个值，例如 智谱 https://open.bigmodel.cn/api/paas/v4 + glm-4.7，
-  # 或 OpenAI https://api.openai.com/v1 + gpt-4o-mini。
-  AI_REVIEW_BASE_URL: https://api.deepseek.com
-  AI_REVIEW_MODEL: deepseek-chat
+  # 下面默认按 DeepSeek 配置；用中转站/其他服务商时不用改这个文件——
+  # 在仓库 Settings → Secrets and variables → Actions → Variables 页添加
+  # AI_REVIEW_BASE_URL（如 https://你的中转站/v1）和 AI_REVIEW_MODEL 即可覆盖默认值。
+  AI_REVIEW_BASE_URL: ${{ vars.AI_REVIEW_BASE_URL || 'https://api.deepseek.com' }}
+  AI_REVIEW_MODEL: ${{ vars.AI_REVIEW_MODEL || 'deepseek-chat' }}
   AI_REVIEW_MOCK: ${{ inputs.mock || 'false' }} # 演示模式开关（workflow_dispatch 时可设 true）
   AI_REVIEW_BLOCK_ON_SEVERITIES: "" # 例如 "P0,P1"：发现对应级别问题就让流水线失败；空 = 只评论不拦截
 
