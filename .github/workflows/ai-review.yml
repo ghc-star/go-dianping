@@ -1,0 +1,135 @@
+# AI 机器人代码审查（GitHub 版）
+# 结构对照 GitLab 公司模板（devops/devops-cicd 的 ai-code-review.yml）：
+#   include 模板            → 本文件（没有公司模板库，审查逻辑直接写在这里）
+#   AI_REVIEW_* variables   → 下面 env 段，同样是"项目只管配置"
+#   .gitlab/ai-review/*.md  → .github/ai-review/prompt.md + skills.md（机器人的"脑子"）
+#   preflight job           → 同样先检查材料再干活，缺东西快速失败并给出操作指引
+name: AI Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened] # PR 创建、新提交推送、重新打开时各审一次
+
+permissions:
+  contents: read
+  pull-requests: write # 允许把审查结果发成 PR 评论
+  models: read # 允许用内置 GITHUB_TOKEN 调 GitHub Models（公共仓库免费）
+
+concurrency:
+  group: ai-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  AI_REVIEW_PROMPT_FILE: .github/ai-review/prompt.md # 评审任务书
+  AI_REVIEW_SKILLS_FILE: .github/ai-review/skills.md # 项目规则
+  AI_REVIEW_OUTPUT_MARKER: "<!-- ai-review-bot -->" # 评论尾部的隐藏标记，用于找到并更新既有评论
+  AI_REVIEW_MAX_DIFF_CHARS: "60000" # 发给模型的 diff 上限（控制成本）
+  # 默认走 GitHub Models（凭据就是内置 GITHUB_TOKEN，无需任何配置）。
+  # 想换 DeepSeek/OpenAI 等 OpenAI 兼容接口：添加仓库 Secret AI_REVIEW_API_KEY，
+  # 并改这两个值，例如 https://api.deepseek.com + deepseek-chat。
+  AI_REVIEW_BASE_URL: https://models.github.ai/inference
+  AI_REVIEW_MODEL: openai/gpt-4o-mini
+  AI_REVIEW_BLOCK_ON_SEVERITIES: "" # 例如 "P0,P1"：发现对应级别问题就让流水线失败；空 = 只评论不拦截
+
+jobs:
+  preflight:
+    name: 前置检查
+    runs-on: ubuntu-latest
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 检查审查材料与 diff
+        run: |
+          set -euo pipefail
+          for f in "$AI_REVIEW_PROMPT_FILE" "$AI_REVIEW_SKILLS_FILE"; do
+            if [ ! -f "$f" ]; then
+              echo "缺少 $f —— 没有它机器人不知道按什么标准审查，请先提交该文件。"
+              exit 1
+            fi
+          done
+          if [ -z "$(gh pr diff "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" | head -c 200)" ]; then
+            echo "PR diff 为空，后续审查 job 将跳过。"
+            exit 0
+          fi
+          echo "前置检查通过：prompt 与 skills 就位，diff 非空。"
+
+  review:
+    name: AI 代码审查
+    needs: preflight # 前置检查不过就不浪费模型调用
+    runs-on: ubuntu-latest
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      AI_REVIEW_API_KEY: ${{ secrets.AI_REVIEW_API_KEY }} # 未配置时为空，自动回退到 GITHUB_TOKEN
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 拉取 diff、调用模型、发布评论
+        run: |
+          set -euo pipefail
+
+          # ── 1. 拿本次 PR 的 diff，超长截断，控制发给模型的内容量 ──
+          DIFF=$(gh pr diff "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" | head -c "$AI_REVIEW_MAX_DIFF_CHARS")
+          if [ -z "$DIFF" ]; then
+            echo "diff 为空，跳过审查。"
+            exit 0
+          fi
+
+          # ── 2. 组装 prompt：任务书 + 项目规则 进 system，diff 进 user ──
+          SYSTEM=$(printf '%s\n\n# 项目规则（skills）\n\n%s' \
+            "$(cat "$AI_REVIEW_PROMPT_FILE")" "$(cat "$AI_REVIEW_SKILLS_FILE")")
+          USER=$(printf '请审查以下 pull request #%s 的 diff：\n\n```diff\n%s\n```' "$PR_NUMBER" "$DIFF")
+          PAYLOAD=$(jq -n \
+            --arg model "$AI_REVIEW_MODEL" \
+            --arg system "$SYSTEM" \
+            --arg user "$USER" \
+            '{model: $model, temperature: 0.2,
+              messages: [{role: "system", content: $system}, {role: "user", content: $user}]}')
+
+          # ── 3. 调用模型（OpenAI 兼容接口）──
+          AUTH="${AI_REVIEW_API_KEY:-$GITHUB_TOKEN}"
+          RESPONSE=$(curl -sf --max-time 180 \
+            "$AI_REVIEW_BASE_URL/chat/completions" \
+            -H "Authorization: Bearer $AUTH" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD") || {
+              echo "模型调用失败。用 GitHub Models 时请确认公共仓库额度；或配置 AI_REVIEW_API_KEY 换用第三方接口。"
+              exit 1
+            }
+          REVIEW=$(printf '%s' "$RESPONSE" | jq -r '.choices[0].message.content // empty')
+          if [ -z "$REVIEW" ]; then
+            echo "模型没有返回内容，原始响应："
+            printf '%s\n' "$RESPONSE" | head -c 2000
+            exit 1
+          fi
+
+          # ── 4. 可选拦截：发现指定级别问题就让流水线失败 ──
+          if [ -n "$AI_REVIEW_BLOCK_ON_SEVERITIES" ]; then
+            for SEV in $(printf '%s' "$AI_REVIEW_BLOCK_ON_SEVERITIES" | tr ',' ' '); do
+              if printf '%s' "$REVIEW" | grep -qE "^\*\*$SEV\*\*"; then
+                echo "发现 $SEV 级问题，按 AI_REVIEW_BLOCK_ON_SEVERITIES 配置拦截："
+                printf '%s\n' "$REVIEW"
+                exit 1
+              fi
+            done
+          fi
+
+          # ── 5. 发评论；同一 PR 反复推送时更新既有评论，不刷屏 ──
+          BODY=$(printf '%s\n\n%s' "$REVIEW" "$AI_REVIEW_OUTPUT_MARKER")
+          EXISTING_ID=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" \
+            --jq ".[] | select(.body | contains(\"$AI_REVIEW_OUTPUT_MARKER\")) | .id" \
+            | head -1 || true)
+          if [ -n "$EXISTING_ID" ]; then
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments/$EXISTING_ID" \
+              -f body="$BODY" >/dev/null
+            echo "已更新既有审查评论（$EXISTING_ID）。"
+          else
+            gh api -X POST "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" \
+              -f body="$BODY" >/dev/null
+            echo "已发布审查评论。"
+          fi
