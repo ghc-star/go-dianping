@@ -32,6 +32,9 @@ test-race: ## 竞态检测模式下运行测试（需要 CGO；CI 的 Linux runn
 build: ## 编译可执行文件到 bin/ 目录
 	$(GO) build -o $(BIN_DIR)/dianping ./cmd/service
 
+run: ## 本地启动服务（需要已配好 MySQL_DSN、REDIS_ADDR 等环境变量）
+	$(GO) run ./cmd/service
+
 ci: fmt-check vet test build ## CI 入口：格式检查 → vet → 测试 → 编译
 
 clean: ## 删除构建产物
