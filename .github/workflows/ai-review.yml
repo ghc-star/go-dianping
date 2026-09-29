@@ -162,7 +162,9 @@ jobs:
             --jq ".[] | select(.body | contains(\"$AI_REVIEW_OUTPUT_MARKER\")) | .id" \
             | head -1 || true)
           if [ -n "$EXISTING_ID" ]; then
-            gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments/$EXISTING_ID" \
+            # 注意：单条评论的 PATCH 路由没有 issue 编号（issues/comments/{id}），
+            # 拼成 issues/{n}/comments/{id} 会 404——这是实测踩过的坑。
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$EXISTING_ID" \
               -f body="$BODY" >/dev/null
             echo "已更新既有审查评论（$EXISTING_ID）。"
           else
