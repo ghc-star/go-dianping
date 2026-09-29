@@ -9,11 +9,21 @@ name: AI Review
 on:
   pull_request:
     types: [opened, synchronize, reopened] # PR 创建、新提交推送、重新打开时各审一次
+  workflow_dispatch: # 手动触发：可对任意 PR 重跑审查；没有 API key 时可用 mock 模式演示全流程
+    inputs:
+      pr_number:
+        description: 要审查的 PR 编号
+        required: true
+        type: string
+      mock:
+        description: 演示模式（true = 跳过模型调用，用固定文本验证流程）
+        required: false
+        default: "false"
+        type: string
 
 permissions:
   contents: read
   pull-requests: write # 允许把审查结果发成 PR 评论
-  models: read # 允许用内置 GITHUB_TOKEN 调 GitHub Models（公共仓库免费）
 
 concurrency:
   group: ai-review-${{ github.event.pull_request.number }}
@@ -24,11 +34,14 @@ env:
   AI_REVIEW_SKILLS_FILE: .github/ai-review/skills.md # 项目规则
   AI_REVIEW_OUTPUT_MARKER: "<!-- ai-review-bot -->" # 评论尾部的隐藏标记，用于找到并更新既有评论
   AI_REVIEW_MAX_DIFF_CHARS: "60000" # 发给模型的 diff 上限（控制成本）
-  # 默认走 GitHub Models（凭据就是内置 GITHUB_TOKEN，无需任何配置）。
-  # 想换 DeepSeek/OpenAI 等 OpenAI 兼容接口：添加仓库 Secret AI_REVIEW_API_KEY，
-  # 并改这两个值，例如 https://api.deepseek.com + deepseek-chat。
-  AI_REVIEW_BASE_URL: https://models.github.ai/inference
-  AI_REVIEW_MODEL: openai/gpt-4o-mini
+  # 模型走任意 OpenAI 兼容接口，凭据放仓库 Secret AI_REVIEW_API_KEY。
+  # 注意：GitHub Models 已于 2026-07-30 退役，不能再依赖内置 GITHUB_TOKEN 调模型。
+  # 下面按 DeepSeek 配置（key 申请：platform.deepseek.com）；
+  # 换其他服务商只需改这两个值，例如 智谱 https://open.bigmodel.cn/api/paas/v4 + glm-4.7，
+  # 或 OpenAI https://api.openai.com/v1 + gpt-4o-mini。
+  AI_REVIEW_BASE_URL: https://api.deepseek.com
+  AI_REVIEW_MODEL: deepseek-chat
+  AI_REVIEW_MOCK: ${{ inputs.mock || 'false' }} # 演示模式开关（workflow_dispatch 时可设 true）
   AI_REVIEW_BLOCK_ON_SEVERITIES: "" # 例如 "P0,P1"：发现对应级别问题就让流水线失败；空 = 只评论不拦截
 
 jobs:
@@ -37,12 +50,13 @@ jobs:
     runs-on: ubuntu-latest
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      PR_NUMBER: ${{ github.event.pull_request.number }}
+      PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+      AI_REVIEW_API_KEY: ${{ secrets.AI_REVIEW_API_KEY }}
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
 
-      - name: 检查审查材料与 diff
+      - name: 检查审查材料、凭据与 diff
         run: |
           set -euo pipefail
           for f in "$AI_REVIEW_PROMPT_FILE" "$AI_REVIEW_SKILLS_FILE"; do
@@ -51,11 +65,19 @@ jobs:
               exit 1
             fi
           done
+          if [ "$AI_REVIEW_MOCK" != "true" ] && [ -z "$AI_REVIEW_API_KEY" ]; then
+            echo "未配置模型凭据（GitHub Models 已于 2026-07-30 退役，内置 GITHUB_TOKEN 不再可用）。"
+            echo "请任选其一："
+            echo "  1. 仓库 Settings → Secrets and variables → Actions 添加 AI_REVIEW_API_KEY，"
+            echo "     并按需要调整 env 里的 AI_REVIEW_BASE_URL / AI_REVIEW_MODEL。"
+            echo "  2. 用 workflow_dispatch 手动触发并勾选 mock 演示模式，体验全流程。"
+            exit 1
+          fi
           if [ -z "$(gh pr diff "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" | head -c 200)" ]; then
             echo "PR diff 为空，后续审查 job 将跳过。"
             exit 0
           fi
-          echo "前置检查通过：prompt 与 skills 就位，diff 非空。"
+          echo "前置检查通过：prompt 与 skills 就位，凭据/演示模式就绪，diff 非空。"
 
   review:
     name: AI 代码审查
@@ -63,8 +85,8 @@ jobs:
     runs-on: ubuntu-latest
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      PR_NUMBER: ${{ github.event.pull_request.number }}
-      AI_REVIEW_API_KEY: ${{ secrets.AI_REVIEW_API_KEY }} # 未配置时为空，自动回退到 GITHUB_TOKEN
+      PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+      AI_REVIEW_API_KEY: ${{ secrets.AI_REVIEW_API_KEY }}
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
@@ -91,25 +113,37 @@ jobs:
             '{model: $model, temperature: 0.2,
               messages: [{role: "system", content: $system}, {role: "user", content: $user}]}')
 
-          # ── 3. 调用模型（OpenAI 兼容接口）；任何异常都把原始响应打进日志便于排查 ──
-          AUTH="${AI_REVIEW_API_KEY:-$GITHUB_TOKEN}"
-          HTTP_CODE=$(curl -sL --max-time 180 -o model_resp.json -w '%{http_code}' \
-            "$AI_REVIEW_BASE_URL/chat/completions" \
-            -H "Authorization: Bearer $AUTH" \
-            -H "Content-Type: application/json" \
-            -d "$PAYLOAD") || { echo "curl 本身失败（exit=$?）。"; exit 1; }
-          echo "模型接口返回 HTTP $HTTP_CODE。"
-          if [ "$HTTP_CODE" != "200" ]; then
-            echo "非 200 响应，原始内容："
-            head -c 2000 model_resp.json
-            exit 1
+          # ── 3. 调用模型（OpenAI 兼容接口）；mock 模式用固定文本代替，验证全链路 ──
+          if [ "$AI_REVIEW_MOCK" = "true" ]; then
+            REVIEW="> ⚠️ 演示模式：本次评论由固定文本生成，未调用模型。配置 AI_REVIEW_API_KEY 后即为真实审查。
+
+            **P3** \`README.md\`：CI/CD 一节可补充 AI 审查的触发条件说明（当前仅 PR 事件触发），方便协作者理解。
+            **P3** \`Makefile\`：\`run\` 目标依赖外部环境变量，可考虑在注释中列出必需项清单。
+
+            未发现需要阻塞或修改的问题。
+
+            建议人工关注：本地执行 \`make ci\` 确认格式、vet、测试、编译全部通过；启动服务确认 README 的运行步骤可复现。"
+            echo "演示模式：跳过模型调用。"
+          else
+            AUTH="${AI_REVIEW_API_KEY}"
+            HTTP_CODE=$(curl -sL --max-time 180 -o model_resp.json -w '%{http_code}' \
+              "$AI_REVIEW_BASE_URL/chat/completions" \
+              -H "Authorization: Bearer $AUTH" \
+              -H "Content-Type: application/json" \
+              -d "$PAYLOAD") || { echo "curl 本身失败（exit=$?）。"; exit 1; }
+            echo "模型接口返回 HTTP $HTTP_CODE。"
+            if [ "$HTTP_CODE" != "200" ]; then
+              echo "非 200 响应，原始内容："
+              head -c 2000 model_resp.json
+              exit 1
+            fi
+            if ! REVIEW=$(jq -r '.choices[0].message.content // empty' model_resp.json 2>/dev/null) || [ -z "$REVIEW" ]; then
+              echo "响应不是合法的补全 JSON 或没有内容，原始内容："
+              head -c 2000 model_resp.json
+              exit 1
+            fi
+            rm -f model_resp.json
           fi
-          if ! REVIEW=$(jq -r '.choices[0].message.content // empty' model_resp.json 2>/dev/null) || [ -z "$REVIEW" ]; then
-            echo "响应不是合法的补全 JSON 或没有内容，原始内容："
-            head -c 2000 model_resp.json
-            exit 1
-          fi
-          rm -f model_resp.json
 
           # ── 4. 可选拦截：发现指定级别问题就让流水线失败 ──
           if [ -n "$AI_REVIEW_BLOCK_ON_SEVERITIES" ]; then
